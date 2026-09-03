@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Linkding Bookmarks",
   "version": "1.0.0",
-  "author": "@caffeinatedMike on GitHub",
+  "author": "@yeahgoodthanks on GitHub",
   "description": "A dropdown for your Linkding bookmarks, sorted by tags.",
   "permissions": [
     "storage",
@@ -12,10 +12,7 @@
     "contextMenus",
     "notifications"
   ],
-  "host_permissions": [
-    "http://*/",
-    "https://*/"
-  ],
+  "host_permissions": ["http://*/", "https://*/"],
   "action": {
     "default_icon": {
       "16": "icons/favicon16.png",
@@ -31,9 +28,24 @@
   "options_page": "options.html",
 
   "background": {
+    "scripts": ["background.js"],
     "service_worker": "background.js"
   },
   "side_panel": {
     "default_path": "side_panel.html"
+  },
+  "sidebar_action": {
+    "default_panel": "side_panel.html",
+    "default_title": "LinkDing",
+    "default_icon": "icons/favicon48.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "linkding@yeahgoodthanks",
+      "strict_min_version": "58.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
   }
 }
