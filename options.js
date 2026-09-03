@@ -5,34 +5,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusDiv = document.getElementById('status');
   const syncBtn = document.getElementById('sync-btn');
   const syncStatusDiv = document.getElementById('sync-status');
-  const displayModeRadios = document.querySelectorAll('input[name="display-mode"]');
   const showTagsCheckbox = document.getElementById('show-tags');
   const showActionsCheckbox = document.getElementById('show-actions');
-  const sidePanelShowTagsCheckbox = document.getElementById('side-panel-show-tags');
-  const sidePanelShowActionsCheckbox = document.getElementById('side-panel-show-actions');
 
   // --- Bookmarks Sync Logic ---
 
   const SYNC_FOLDER_TITLE = 'Linkding Bookmarks';
-
-  async function fetchAllBookmarks(url, token) {
-    let bookmarks = [];
-    let nextUrl = `${url}/api/bookmarks/?limit=100`;
-
-    while (nextUrl) {
-        const response = await fetch(nextUrl, {
-            headers: { 'Authorization': `Token ${token}` }
-        });
-
-        if (!response.ok) {
-            throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-        }
-        const data = await response.json();
-        bookmarks.push(...data.results);
-        nextUrl = data.next;
-    }
-    return bookmarks;
-  }
 
   function groupBookmarksByTag(bookmarks) {
       const bookmarksByTag = {};
@@ -94,12 +72,14 @@ document.addEventListener('DOMContentLoaded', () => {
       }
   }
 
+  // Builds a throwaway LinkdingApi client from form values, rather than
+  // chrome.storage, since the user may be testing/saving credentials
+  // that haven't been persisted yet.
   async function testConnection(url, token) {
     try {
-      const response = await fetch(`${url}/api/`, {
-        headers: { 'Authorization': `Token ${token}` }
-      });
-      return response.ok;
+      const api = new LinkdingApi({ baseUrl: url, token });
+      await api.get('/api/');
+      return true;
     } catch (error) {
       return false;
     }
@@ -134,43 +114,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function saveSidePanelUiSettings() {
-    chrome.storage.sync.set({
-      sidePanelShowTags: sidePanelShowTagsCheckbox.checked,
-      sidePanelShowActions: sidePanelShowActionsCheckbox.checked,
-    });
-  }
-
   async function restoreOptions() {
     const {
       linkdingUrl,
       apiToken,
-      displayMode = 'popup',
       showTags = true,
       showActions = true,
-      sidePanelShowTags = true,
-      sidePanelShowActions = true
     } = await chrome.storage.sync.get({
       linkdingUrl: '',
       apiToken: '',
-      displayMode: 'popup',
       showTags: true,
       showActions: true,
-      sidePanelShowTags: true,
-      sidePanelShowActions: true,
     });
 
     if (linkdingUrl) linkdingUrlInput.value = linkdingUrl;
     if (apiToken) apiTokenInput.value = apiToken;
 
-    const selectedRadio = document.querySelector(`input[name="display-mode"][value="${displayMode}"]`);
-    if (selectedRadio) selectedRadio.checked = true;
-
     showTagsCheckbox.checked = showTags;
     showActionsCheckbox.checked = showActions;
-
-    sidePanelShowTagsCheckbox.checked = sidePanelShowTags;
-    sidePanelShowActionsCheckbox.checked = sidePanelShowActions;
   }
 
   async function syncToBookmarksBar() {
@@ -179,11 +140,12 @@ document.addEventListener('DOMContentLoaded', () => {
     syncStatusDiv.textContent = 'Syncing... Step 1/4: Fetching bookmarks...';
 
     try {
-        const { linkdingUrl, apiToken } = await chrome.storage.sync.get(['linkdingUrl', 'apiToken']);
-        if (!linkdingUrl || !apiToken) throw new Error('Linkding URL or API Token not set.');
+        // Goes through the shared Linkding facade so this sync uses the
+        // same cache that the popup/side panel read from, and forces a
+        // refresh so we always sync against current data.
+        const linkding = await createLinkding();
+        const allBookmarks = await linkding.getBookmarks({ forceRefresh: true });
 
-        const allBookmarks = await fetchAllBookmarks(linkdingUrl, apiToken);
-        
         syncStatusDiv.textContent = `Syncing... Step 2/4: Processing ${allBookmarks.length} bookmarks...`;
         const bookmarksByTag = groupBookmarksByTag(allBookmarks);
         const tagTree = buildTagTree(Object.keys(bookmarksByTag));
@@ -208,15 +170,8 @@ document.addEventListener('DOMContentLoaded', () => {
   form.addEventListener('submit', saveOptions);
   syncBtn.addEventListener('click', syncToBookmarksBar);
 
-  displayModeRadios.forEach(radio => {
-    radio.addEventListener('change', (e) => chrome.storage.sync.set({ displayMode: e.target.value }));
-  });
-
   showTagsCheckbox.addEventListener('change', saveUiSettings);
   showActionsCheckbox.addEventListener('change', saveUiSettings);
-
-  sidePanelShowTagsCheckbox.addEventListener('change', saveSidePanelUiSettings);
-  sidePanelShowActionsCheckbox.addEventListener('change', saveSidePanelUiSettings);
 
   restoreOptions();
 });

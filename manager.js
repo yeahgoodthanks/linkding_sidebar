@@ -10,9 +10,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let tagTree = {};
     let allBookmarksFlat = [];
     let allTags = [];
-    let config = {};
     let currentTag = null;
     let contextMenu = null;
+    let linkding = null;
 
     function showError(message, showOptionsLink = false) {
         loadingMessage.classList.add('hidden');
@@ -25,128 +25,15 @@ document.addEventListener('DOMContentLoaded', () => {
         errorMessage.classList.remove('hidden');
     }
 
-    // --- API Functions ---
-    async function apiRequest(endpoint, options = {}) {
-        const response = await fetch(`${config.cleanedUrl}${endpoint}`, {
-            ...options,
-            headers: {
-                'Authorization': `Token ${config.apiToken}`,
-                'Content-Type': 'application/json',
-                ...options.headers,
-            },
-        });
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API request failed: ${response.status} ${response.statusText}. ${errorText}`);
-        }
-        if (response.status === 204) return null; // No Content for DELETE
-        return response.json();
-    }
-
-    async function updateBookmark(bookmarkId, data) {
-        return apiRequest(`/api/bookmarks/${bookmarkId}/`, {
-            method: 'PUT',
-            body: JSON.stringify(data),
-        });
-    }
-
-    async function deleteBookmark(bookmarkId) {
-        return apiRequest(`/api/bookmarks/${bookmarkId}/`, { method: 'DELETE' });
+    function broadcastBookmarkChange(reason, payload) {
+        chrome.runtime.sendMessage({
+            type: 'linkding-bookmarks-changed',
+            reason,
+            ...payload,
+        }).catch(() => {});
     }
 
     // --- DOM & Rendering ---
-
-    function createTagAutocomplete(input, container) {
-        const suggestionsDiv = document.createElement('div');
-        suggestionsDiv.className = 'tag-suggestions hidden';
-        container.appendChild(suggestionsDiv);
-
-        input.addEventListener('input', () => {
-            const terms = input.value.split(',').map(t => t.trim());
-            const currentTerm = terms[terms.length - 1].toLowerCase();
-
-            if (!currentTerm) {
-                suggestionsDiv.classList.add('hidden');
-                return;
-            }
-
-            const filteredTags = allTags.filter(tag => tag.toLowerCase().startsWith(currentTerm) && !terms.includes(tag));
-            suggestionsDiv.innerHTML = '';
-
-            if (filteredTags.length > 0) {
-                suggestionsDiv.classList.remove('hidden');
-                filteredTags.forEach(tag => {
-                    const item = document.createElement('div');
-                    item.className = 'tag-suggestion-item';
-                    item.textContent = tag;
-                    item.addEventListener('click', () => {
-                        terms[terms.length - 1] = tag;
-                        input.value = terms.join(', ') + ', ';
-                        suggestionsDiv.classList.add('hidden');
-                        input.focus();
-                    });
-                    suggestionsDiv.appendChild(item);
-                });
-            } else {
-                suggestionsDiv.classList.add('hidden');
-            }
-        });
-    }
-
-    function escapeHTML(str) {
-        if (str === null || str === undefined) return '';
-        const p = document.createElement('p');
-        p.textContent = str;
-        return p.innerHTML;
-    }
-
-    function createEditForm(bookmark, li) {
-        const form = document.createElement('form');
-        form.className = 'edit-form';
-        form.innerHTML = `
-            <div><label>Title</label><input name="title" value="${escapeHTML(bookmark.title || bookmark.website_title || '')}"></div>
-            <div><label>URL</label><input name="url" value="${escapeHTML(bookmark.url)}"></div>
-            <div><label>Description</label><textarea name="description" rows="3">${escapeHTML(bookmark.description || '')}</textarea></div>
-            <div class="tag-input-container"><label>Tags (comma-separated)</label><input name="tags" value="${escapeHTML(bookmark.tag_names.join(', '))}, " autocomplete="off"></div>
-            <div class="edit-form-actions">
-                <button type="submit" class="save-btn">Save</button>
-                <button type="button" class="cancel-btn">Cancel</button>
-            </div>
-        `;
-
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData(form);
-            const updatedData = {
-                ...bookmark, // Preserve other fields like is_archived
-                url: formData.get('url'),
-                title: formData.get('title'),
-                description: formData.get('description'),
-                tag_names: formData.get('tags').split(',').map(t => t.trim()).filter(Boolean),
-            };
-            try {
-                const updatedBookmark = await updateBookmark(bookmark.id, updatedData);
-                await invalidatePopupCache();
-
-                const index = allBookmarksFlat.findIndex(b => b.id === bookmark.id);
-                if (index !== -1) allBookmarksFlat[index] = updatedBookmark;
-                allBookmarksByTag = groupBookmarksByTag(allBookmarksFlat);
-                allTags = [...new Set(allBookmarksFlat.flatMap(b => b.tag_names))].sort();
-
-                reRenderUI();
-            } catch (error) {
-                alert(`An error occurred: ${error.message}`);
-            }
-        });
-
-        form.querySelector('.cancel-btn').addEventListener('click', () => {
-            renderBookmarksForTag(currentTag);
-        });
-
-        li.innerHTML = ''; // Clear the list item
-        li.appendChild(form); // And add the form
-        createTagAutocomplete(form.querySelector('input[name="tags"]'), form.querySelector('.tag-input-container'));
-    }
 
     function createContextMenu() {
         if (contextMenu) document.body.removeChild(contextMenu);
@@ -160,15 +47,87 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    async function openEditInSidePanel(bookmark) {
+        // Make sure only one Manager edit button is disabled at a time.
+        document.querySelectorAll('button[data-editing="true"]').forEach(btn => {
+            btn.disabled = false;
+            btn.dataset.editing = 'false';
+            delete btn.dataset.editingId;
+        });
+
+        // Find the edit button for this bookmark so we can disable it while the form is open.
+        const li = document.querySelector(`li[data-bookmark-id="${bookmark.id}"]`);
+        const editBtn = document.querySelector(`li[data-bookmark-id="${bookmark.id}"] button[title="Edit"]`);
+        if (li) li.draggable = false;
+        if (editBtn) {
+            editBtn.disabled = true;
+            editBtn.dataset.editing = 'true';
+            editBtn.dataset.editingId = String(bookmark.id);
+        }
+
+        try {
+            // Open the side panel in the active tab (must call open while user action is active).
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tab?.id) {
+                try {
+                    await chrome.sidePanel.open({ tabId: tab.id });
+                } catch (err) {
+                    // If sidePanel.open fails we still proceed to set session key so the side panel
+                    // will show the form the next time it is opened.
+                    console.warn('chrome.sidePanel.open failed', err);
+                }
+            }
+
+            // Write a session key that the side panel listens for.
+            await chrome.storage.session.set({
+                activeBookmarkForm: {
+                    source: 'manager',
+                    bookmark,
+                    ts: Date.now(),
+                },
+            });
+        } catch (error) {
+            console.error('Could not open edit form in side panel:', error);
+            // Re-enable draggable and the edit button on error.
+            if (li) li.draggable = true;
+            if (editBtn) {
+                editBtn.disabled = false;
+                editBtn.dataset.editing = 'false';
+                delete editBtn.dataset.editingId;
+            }
+            alert('Could not open side panel to edit bookmark.');
+        }
+    }
+
+    // Add a storage listener so the Manager re-enables any disabled edit buttons
+    chrome.storage.onChanged.addListener((changes, namespace) => {
+        if (namespace !== 'session') return;
+        // If activeBookmarkForm was cleared (removed or set to null), re-enable any items we disabled.
+        if (changes?.activeBookmarkForm && !changes.activeBookmarkForm.newValue) {
+            document.querySelectorAll('li[draggable="false"]').forEach(li => {
+                li.draggable = true;
+            })
+            document.querySelectorAll('button[data-editing="true"]').forEach(btn => {
+                btn.disabled = false;
+                btn.dataset.editing = 'false';
+                delete btn.dataset.editingId;
+            });
+        }
+    });
+
     async function handleAddFolder(parentTag) {
-        const newFolderName = prompt(`Enter new folder name inside "${parentTag}":`);
+        const isUntagged = parentTag === '[Untagged]';
+        const promptText = isUntagged ?
+            'Enter name for new top-level folder:' :
+            `Enter name for new subfolder inside "${parentTag}":`;
+        const newFolderName = prompt(promptText);
         if (!newFolderName || !newFolderName.trim()) return;
         if (newFolderName.includes('.')) {
             alert('Folder names cannot contain periods.');
             return;
         }
 
-        const newTagName = parentTag === '[Untagged]' ? newFolderName.trim() : `${parentTag}.${newFolderName.trim()}`;
+        const newTagName = isUntagged ? newFolderName.trim() : `${parentTag}.${newFolderName.trim()}`;
 
         if (allBookmarksByTag[newTagName]) {
             alert(`Folder "${newTagName}" already exists.`);
@@ -203,12 +162,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const updatePromises = bookmarksToUpdate.map(bookmark => {
             const updatedTags = bookmark.tag_names.map(tag => tag.startsWith(fullTag) ? newFullTag + tag.substring(fullTag.length) : tag);
-            return updateBookmark(bookmark.id, { ...bookmark, tag_names: [...new Set(updatedTags)] });
+            return linkding.updateBookmark(bookmark.id, { ...bookmark, tag_names: [...new Set(updatedTags)] });
         });
 
         try {
-            await Promise.all(updatePromises);
-            await invalidatePopupCache();
+            const updatedBookmarks = await Promise.all(updatePromises);
+            broadcastBookmarkChange('updated', { bookmarks: updatedBookmarks });
             await loadData(true);
         } catch (error) {
             alert(`An error occurred: ${error.message}`);
@@ -229,12 +188,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const updatePromises = bookmarksToUpdate.map(bookmark => {
             const updatedTags = bookmark.tag_names.filter(tag => !tag.startsWith(fullTag));
-            return updateBookmark(bookmark.id, { ...bookmark, tag_names: updatedTags });
+            return linkding.updateBookmark(bookmark.id, { ...bookmark, tag_names: updatedTags });
         });
 
         try {
-            await Promise.all(updatePromises);
-            await invalidatePopupCache();
+            const updatedBookmarks = await Promise.all(updatePromises);
+            broadcastBookmarkChange('updated', { bookmarks: updatedBookmarks });
             await loadData(true);
         } catch (error) {
             alert(`An error occurred: ${error.message}`);
@@ -263,8 +222,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const updatedData = { ...bookmark, tag_names: [...new Set(newTags)] };
 
         try {
-            const updatedBookmark = await updateBookmark(bookmark.id, updatedData);
-            await invalidatePopupCache();
+            const updatedBookmark = await linkding.updateBookmark(bookmark.id, updatedData);
+            broadcastBookmarkChange('updated', { bookmarks: [updatedBookmark] });
 
             const index = allBookmarksFlat.findIndex(b => b.id === bookmark.id);
             if (index !== -1) allBookmarksFlat[index] = updatedBookmark;
@@ -321,8 +280,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 removeBtn.addEventListener('click', async () => {
                     const updatedTags = bookmark.tag_names.filter(t => t !== tagName);
                     try {
-                        const updatedBookmark = await updateBookmark(bookmark.id, { ...bookmark, tag_names: updatedTags });
-                        await invalidatePopupCache();
+                        const updatedBookmark = await linkding.updateBookmark(bookmark.id, { ...bookmark, tag_names: updatedTags });
+                        broadcastBookmarkChange('updated', { bookmarks: [updatedBookmark] });
 
                         const index = allBookmarksFlat.findIndex(b => b.id === bookmark.id);
                         if (index !== -1) allBookmarksFlat[index] = updatedBookmark;
@@ -346,8 +305,9 @@ document.addEventListener('DOMContentLoaded', () => {
         editBtn.title = 'Edit';
         editBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>`;
         editBtn.addEventListener('click', () => {
+            // Use the shared side-panel form rather than inline edit.
             li.draggable = false;
-            createEditForm(bookmark, li);
+            openEditInSidePanel(bookmark);
         });
 
         const deleteBtn = document.createElement('button');
@@ -357,8 +317,8 @@ document.addEventListener('DOMContentLoaded', () => {
         deleteBtn.addEventListener('click', async () => {
             if (confirm(`Are you sure you want to delete "${title}"?`)) {
                 try {
-                    await deleteBookmark(bookmark.id);
-                    await invalidatePopupCache();
+                    await linkding.deleteBookmark(bookmark.id);
+                    broadcastBookmarkChange('deleted', { bookmarkIds: [bookmark.id] });
                     allBookmarksFlat = allBookmarksFlat.filter(b => b.id !== bookmark.id);
                     allBookmarksByTag = groupBookmarksByTag(allBookmarksFlat);
                     allTags = [...new Set(allBookmarksFlat.flatMap(b => b.tag_names))].sort();
@@ -370,6 +330,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         li.addEventListener('dragstart', (e) => {
+            if (!li.draggable) {
+                e.preventDefault();
+                return;
+            }
             // We need to pass both the bookmark ID and its original tag
             const payload = { id: bookmark.id, sourceTag: sourceTag };
             e.dataTransfer.setData('application/json', JSON.stringify(payload));
@@ -380,7 +344,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         li.addEventListener('dragend', () => li.classList.remove('dragging'));
 
-
         actionsDiv.appendChild(editBtn);
         actionsDiv.appendChild(deleteBtn);
         li.appendChild(infoDiv);
@@ -388,11 +351,6 @@ document.addEventListener('DOMContentLoaded', () => {
         li.appendChild(actionsDiv);
 
         return li;
-    }
-
-    // --- Cache Invalidation ---
-    async function invalidatePopupCache() {
-        await chrome.storage.local.remove(['cachedBookmarks', 'cacheTimestamp']);
     }
 
     function reRenderUI() {
@@ -525,8 +483,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const isUntagged = potentialTagName === '[Untagged]';
 
                 contextMenu.innerHTML = `
-                    <div class="context-menu-item" data-action="add">New Sub-folder...</div>
-                    <div class="context-menu-item ${isUntagged ? 'disabled' : ''}" data-action="rename">Rename...</div>
+                    <div class="context-menu-item" data-action="add">New ${isUntagged ? 'Top-level folder' : 'Sub-folder'}</div>
+                    <div class="context-menu-item ${isUntagged ? 'disabled' : ''}" data-action="rename">Rename</div>
                     <div class="context-menu-item ${isUntagged ? 'disabled' : ''}" data-action="remove">Remove</div>
                 `;
 
@@ -577,25 +535,6 @@ document.addEventListener('DOMContentLoaded', () => {
         renderFolderTree(tagTree, folderListContainer);
     }
 
-    async function fetchAllBookmarks(url, token) {
-        let bookmarks = [];
-        let nextUrl = `${url}/api/bookmarks/?limit=100`;
-
-        while (nextUrl) {
-            const response = await fetch(nextUrl, {
-                headers: { 'Authorization': `Token ${token}` }
-            });
-
-            if (!response.ok) {
-                throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-            }
-            const data = await response.json();
-            bookmarks.push(...data.results);
-            nextUrl = data.next;
-        }
-        return bookmarks;
-    }
-
     function groupBookmarksByTag(bookmarks) {
         const bookmarksByTag = {};
         bookmarks.forEach(bookmark => {
@@ -644,19 +583,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         try {
-            const settings = await chrome.storage.sync.get(['linkdingUrl', 'apiToken']);
-            if (!settings.linkdingUrl || !settings.apiToken) {
-                showError('Linkding URL or API Token not set. Please configure the extension options.', true);
-                return;
-            }
-
-            config = {
-                linkdingUrl: settings.linkdingUrl,
-                apiToken: settings.apiToken,
-                cleanedUrl: settings.linkdingUrl.trim().replace(/\/$/, '')
-            };
-
-            allBookmarksFlat = await fetchAllBookmarks(config.cleanedUrl, config.apiToken);
+            linkding = await createLinkding();
+            allBookmarksFlat = await linkding.getBookmarks({ forceRefresh });
             allBookmarksByTag = groupBookmarksByTag(allBookmarksFlat);
             allTags = [...new Set(allBookmarksFlat.flatMap(b => b.tag_names))].sort();
 
@@ -685,7 +613,15 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (error) {
             console.error('Error fetching bookmarks:', error);
-            showError(`Failed to load bookmarks. Error: ${error.message}`);
+            const isConfigurationError =
+                error.message.includes('Linkding URL') ||
+                error.message.includes('API token') ||
+                error.message.includes('API Token');
+
+            showError(
+                `Failed to load bookmarks. Error: ${error.message}`,
+                isConfigurationError
+            );
         } finally {
             // On initial load, this hides the loading message. On refresh, this does nothing.
             loadingMessage.classList.add('hidden');
